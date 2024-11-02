@@ -3,15 +3,19 @@
 import time
 import uuid
 import asyncio
-from queue import Queue
+from asyncio import Queue  # Changed from queue.Queue to asyncio.Queue
 from typing import Callable
 
 
-def get_all(queue: Queue) -> list:
+async def get_all(queue: Queue) -> list:  # Made async
     """get_all from queue"""
     res = []
-    while queue and not queue.empty():
-        res.append(queue.get())
+    try:
+        while True:
+            item = queue.get_nowait()  # asyncio Queue's get_nowait
+            res.append(item)
+    except asyncio.QueueEmpty:  # Changed exception type
+        pass
     return res
 
 
@@ -21,13 +25,19 @@ async def transcribe(
     transcriber: Callable[[list], str],
     segment_closed: Callable[[dict], None],
 ):
-    """the transcription loop"""
     window, prev_result, cycles = [], {}, 0
+    print("transcribe loop started")
 
     while not should_stop[0]:
         start = time.time()
-        await asyncio.sleep(0.01)
-        window.extend(get_all(queue))
+        await asyncio.sleep(1)  # Added await here
+        print(f"transcribe loop iteration {queue.qsize()}")
+        qitems = await get_all(queue)
+        if len(qitems) > 0:
+            print(f"found {len(qitems)} items on queue")
+        window.extend(qitems)
+        if len(window) > 0:
+            print(f"window size: {len(window)}")
 
         if not window:
             continue
@@ -58,21 +68,22 @@ def should_close_segment(result: dict, prev_result: dict, cycles, max_cycles=1):
     ).get("text", "")
 
 
-class TrancribeSession:  # pylint: disable=too-few-public-methods
+class TranscribeSession:  # pylint: disable=too-few-public-methods
     """transcription state"""
 
     def __init__(self, transcribe_async, send_back_async) -> None:
         """ctor"""
         self.id = uuid.uuid4()  # pylint: disable=invalid-name
-        self.queue = Queue()
+        self.queue = Queue()  # Now using asyncio.Queue
         self.should_stop = [False]
         self.task = asyncio.create_task(
             transcribe(self.should_stop, self.queue, transcribe_async, send_back_async)
         )
 
-    def add_chunk(self, chunk: bytes):
+    async def add_chunk(self, chunk: bytes):  # Made async
         """add new chunk"""
-        self.queue.put_nowait(chunk)
+        await self.queue.put(chunk)  # Using async put
+        print(f"adding chunk to queue: {len(chunk)} total queue length now {self.queue.qsize()}")
 
     async def stop(self):
         """stop session"""
