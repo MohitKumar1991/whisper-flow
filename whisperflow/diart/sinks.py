@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 from pyannote.core import Annotation, Segment, SlidingWindowFeature, notebook
 from pyannote.database.util import load_rttm
 from pyannote.metrics.diarization import DiarizationErrorRate
-from rx.core import Observer
+from reactivex import Observer
 from typing_extensions import Literal
 
 

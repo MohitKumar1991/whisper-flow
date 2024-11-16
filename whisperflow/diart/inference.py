@@ -97,12 +97,10 @@ class StreamingInference:
         self._chrono = utils.Chronometer(self.unit, self._pbar)
 
         self.stream = self.source.stream
-
-        # Rearrange stream to form sliding windows
-        self.stream = self.stream.pipe(
+        self.stream.subscribe(
             dops.rearrange_audio_stream(
                 chunk_duration, step_duration, source.sample_rate
-            ),
+            )
         )
 
         # Dynamic resampling if the audio source isn't compatible
@@ -176,7 +174,13 @@ class StreamingInference:
         *observers: Observer
             Observers to consume emitted annotations and audio.
         """
-        self.stream = self.stream.pipe(*[ops.do(sink) for sink in observers])
+        self.stream = self.stream.pipe(*[
+            ops.do_action(
+                on_next=sink if callable(sink) else sink.on_next,
+                on_completed=sink.on_completed if hasattr(sink, 'on_completed') else None,
+                on_error=sink.on_error if hasattr(sink, 'on_error') else None
+            ) for sink in observers
+        ])
         self._observers.extend(observers)
 
     def _handle_error(self, error: BaseException):

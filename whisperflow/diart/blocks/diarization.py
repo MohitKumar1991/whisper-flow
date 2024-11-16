@@ -39,12 +39,12 @@ class SpeakerDiarizationConfig(base.PipelineConfig):
     ):
         # Default segmentation model is pyannote/segmentation
         self.segmentation = segmentation or m.SegmentationModel.from_pyannote(
-            "pyannote/segmentation"
+            "pyannote/segmentation-3.0"
         )
 
         # Default embedding model is pyannote/embedding
         self.embedding = embedding or m.EmbeddingModel.from_pyannote(
-            "pyannote/embedding"
+            "pyannote/wespeaker-voxceleb-resnet34-LM"
         )
 
         self._duration = duration

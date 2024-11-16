@@ -2,9 +2,7 @@
 
 import tempfile
 import os
-from collections import deque
 import io
-import numpy as np
 import time
 
 import logging
@@ -12,41 +10,37 @@ from typing import List
 from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 import socketio
+import asyncio
 import json
 from pydub import AudioSegment
 
 from whisperflow import __version__
 import whisperflow.transcriber as ts
+from whisperflow.transcriber import transcribe_pcm_chunks_async
 from .diart.sources import AudioSource
+from reactivex import Observer
+from reactivex.scheduler.eventloop import AsyncIOThreadSafeScheduler
+import reactivex as rx
+from queue import Queue
+from reactivex import operators as ops
+from .ffmpeg import FFmpegAudioStream
 
 
-def convert_webm_bytes_to_wav_bytes(webm_bytes, sample_rate=16000):
-    # Create a temporary file to store the input webm data
-    with tempfile.NamedTemporaryFile(suffix='.webm', delete=False) as temp_webm:
-        temp_webm.write(webm_bytes)
-        temp_webm_path = temp_webm.name
-
-    try:
-        # Load using pydub
-        audio = AudioSegment.from_file(temp_webm_path, format="webm")
+class PrintObserver(Observer):
+    def on_next(self, value):
+        print("PObserver on_next")
+        print(len(value))
+    
+    def on_error(self, error):
+        print(f"Error: {error}")
         
-        # Convert to desired format
-        audio = audio.set_frame_rate(sample_rate)
-        audio = audio.set_channels(1)  # Convert to mono
-        
-        # Export to WAV bytes
-        wav_io = io.BytesIO()
-        audio.export(wav_io, format="wav")
-        return wav_io.getvalue()
-
-    finally:
-        # Clean up temporary file
-        os.unlink(temp_webm_path)
+    def on_completed(self):
+        print("Completed")
 
 # Initialize Socket.IO with the correct configuration
 sio = socketio.AsyncServer(
-    async_mode='asgi',
     cors_allowed_origins='*',
+    async_mode='asgi',
     engineio_logger=True,
     logger=True
 )
@@ -57,14 +51,15 @@ app = FastAPI()
 # Add CORS middleware configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, replace with specific origins
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Wrap with ASGI application
-application = socketio.ASGIApp(sio, app)
+# Create ASGI application
+socket_app = socketio.ASGIApp(sio)
+app.mount("/", socket_app)
 
 sessions = {}
 
@@ -88,108 +83,115 @@ def transcribe_pcm_chunk(
 class AudioSession(AudioSource):
     def __init__(self, transcribe_callback, send_callback, connection_id):
         super().__init__("websocket", 16000)
-        self.audio_chunks = deque()
+        self.audio_chunks = Queue()
         self.transcribe_callback = transcribe_callback
         self.send_callback = send_callback
         self.connection_id = connection_id
-        
-        
-    async def add_chunk(self, chunk):
-        self.audio_chunks.append(chunk)
-        # byte_samples = base64.decodebytes(data.encode("utf-8"))
-        if self.connection_id is not None:
-            samples = np.frombuffer(chunk, dtype=np.float32)
-            samples.reshape(1, -1)
-            self.stream.on_next(samples)
+        self.scheduler = AsyncIOThreadSafeScheduler(asyncio.get_event_loop())
+        self.ffmpeg_stream = FFmpegAudioStream()
 
-    #TODO: this is supposed to start the server - this needs to block
+    def add_chunk(self, chunk):
+        #this is thread safe - so you can put chunks on any thread
+        if chunk is None:
+            print("add_chunk None")
+            return
+        # self.audio_chunks.put(chunk)
+        self.stream.on_next(chunk)
+
+    async def process_audio(self, chunks):
+        print("process_audio running")
+        if len(chunks) == 0:
+            print("no chunks to process")
+            return
+        
+        # Process chunks through FFmpeg stream
+        pcm_chunks = []
+        for chunk in chunks:
+            pcm_data = await self.ffmpeg_stream.process_chunk(chunk)
+            pcm_chunks.append(pcm_data)
+        
+        result = await self.transcribe_callback(pcm_chunks)
+        await self.send_callback(self.connection_id, result)
+    
+    #run in main thread
+    def attach_observer(self, observer):
+        self.stream.subscribe(observer, scheduler=self.scheduler)
+        print("attach_observer", self.stream.observers)
+
+    #this is a blocking function which must be run in a separate thread with run_in_executor - it does nothing but block
     def read(self):
         while self.connection_id is not None:
             time.sleep(0.1)
     
+    # async def read_async(self):
+    #     while self.connection_id is not None:
+    #         try:
+    #             # Sleep briefly to avoid busy waiting
+    #             await asyncio.sleep(0.3)
+    #             print("read running after sleep")
+                
+    #             # Process any available chunks
+    #             if not self.audio_chunks.empty():
+    #                 chunks = []
+    #                 while not self.audio_chunks.empty():
+    #                     chunks.append(self.audio_chunks.get())
+                    
+    #                 combined = b''.join(chunks)
+    #                 self.stream.on_next([combined])
+    #         except Exception as e:
+    #             logging.error(f"Error processing audio chunks: {e}")
+
     def close(self):
         """Close the websocket server"""
-        if self.server is not None:
+        if self.connection_id is not None:
             self.stream.on_completed()
+            asyncio.create_task(self.ffmpeg_stream.close())
             self.connection_id = None
 
-    async def process_audio(self):
-        if not self.audio_chunks:
-            return
-            
-        # Concatenate all chunks
-        combined = b''.join(self.audio_chunks)
-        
-        # Create a temporary file for the input data
-        with tempfile.NamedTemporaryFile(suffix='.webm', delete=False) as temp_webm:
-            temp_webm.write(combined)
-            temp_webm_path = temp_webm.name
-
-        try:
-            from subprocess import run, CalledProcessError
-            
-            # Convert directly to PCM using ffmpeg
-            cmd = [
-                "ffmpeg",
-                "-nostdin",
-                "-threads", "0",
-                "-i", temp_webm_path,
-                "-f", "s16le",
-                "-ac", "1",
-                "-acodec", "pcm_s16le",
-                "-ar", "16000",
-                "-"
-            ]
-            
-            try:
-                pcm_data = run(cmd, capture_output=True, check=True).stdout
-            except CalledProcessError as e:
-                logging.error(f"Failed to convert audio: {e.stderr.decode()}")
-                return
-                
-            # Transcribe the PCM data directly
-            #FIXME: instead of transcribe callback we will put this on the stream
-            result = await self.transcribe_callback([pcm_data])
-            await self.send_callback(result)
-            
-        finally:
-            # Cleanup
-            os.unlink(temp_webm_path)
-        
-        # Clear the queue after processing
-        self.audio_chunks.clear()
+    
 
 @sio.event
-async def connect(sid, environ):
+def connect(sid, environ):
     """Handle new Socket.IO connection"""
     logging.info(f"Client connected: {sid}")
-    sessions[sid] = AudioSession(transcribe_async, lambda x: send_back_async(sid, x), connection_id=sid)
+    audio_session_source = AudioSession(transcribe_async, send_back_async, connection_id=sid)
+    sessions[sid] = audio_session_source
+    #this is supposed to do diarization
+    audio_session_source.attach_observer(PrintObserver())
+    
+    #this is supposed to do transcription - now with buffering
+    audio_session_source.stream.pipe(
+        ops.buffer_with_count(count=3)  # Buffer 3 chunks before emitting
+    ).subscribe(lambda chunks: asyncio.create_task(audio_session_source.process_audio(chunks)))
+
+    print("observers", audio_session_source.stream.observers)
+
+    # asyncio.create_task(audio_session_source.read_async())
 
 @sio.event
-async def disconnect(sid):
+def disconnect(sid):
     """Handle Socket.IO disconnection"""
     logging.info(f"Client disconnected: {sid}")
     if sid in sessions:
-        await sessions[sid].process_audio()  # Process any remaining audio
+        # asyncio.create_task(sessions[sid].process_audio())
         del sessions[sid]
 
 @sio.event
-async def audio_data(sid, data: bytes):
+def audio_data(sid, data: bytes):
     """Handle binary audio data"""
     print(f"audio_data {sid}: {type(data)} {len(data)}")
     if sid in sessions:
-        await sessions[sid].add_chunk(data)
+        sessions[sid].add_chunk(data)
 
 @sio.event
-async def stop_recording(sid, data):
+def stop_recording(sid, data):
     """Handle stop recording command"""
     print(f"stop_recording {sid}: {data}")
     if sid in sessions:
-        await sessions[sid].process_audio()
         sessions[sid].close()
 
 @sio.event
-async def command(sid, data):
+def command(sid, data):
     """Handle text/JSON commands"""
     try:
         if isinstance(data, str):
@@ -201,18 +203,18 @@ async def command(sid, data):
         logging.error("Invalid JSON received")
 
 async def transcribe_async(chunks: list):
-    """Async transcription function"""
+    """Sync transcription function"""
     model = ts.get_model()
-    return await ts.transcribe_pcm_chunks_async(model, chunks)
+    return await transcribe_pcm_chunks_async(model, chunks)
 
 async def send_back_async(sid: str, data: dict):
-    """Send results back to client"""
-    await sio.emit('transcription_result', data, room=sid)
+    """Send results back to client asynchronously"""
+    await sio.emit('transcription_result', data, to=sid)
 
 def start_server(host="localhost", port=8181, reload=False):
-    """Start the FastAPI server"""
+    """Start the server using uvicorn"""
     import uvicorn
-    uvicorn.run("whisperflow.fast_server:application", host=host, port=port, reload=reload)
+    uvicorn.run(app, host=host, port=port, reload=reload)
 
 
 if __name__ == "__main__":

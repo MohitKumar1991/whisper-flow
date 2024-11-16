@@ -33,15 +33,15 @@ def run():
     )
     parser.add_argument(
         "--segmentation",
-        default="pyannote/segmentation",
+        default="pyannote/segmentation-3.0",
         type=str,
-        help=f"{argdoc.SEGMENTATION}. Defaults to pyannote/segmentation",
+        help=f"{argdoc.SEGMENTATION}. Defaults to pyannote/segmentation-3.0",
     )
     parser.add_argument(
         "--embedding",
-        default="pyannote/embedding",
+        default="pyannote/wespeaker-voxceleb-resnet34-LM",
         type=str,
-        help=f"{argdoc.EMBEDDING}. Defaults to pyannote/embedding",
+        help=f"{argdoc.EMBEDDING}. Defaults to pyannote/wespeaker-voxceleb-resnet34-LM",
     )
     parser.add_argument(
         "--duration",

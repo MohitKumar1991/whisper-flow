@@ -2,10 +2,10 @@ from dataclasses import dataclass
 from typing import Callable, Optional, List, Any, Tuple
 
 import numpy as np
-import rx
+import reactivex as rx
 from pyannote.core import Annotation, SlidingWindow, SlidingWindowFeature, Segment
-from rx import operators as ops
-from rx.core import Observable
+from reactivex import operators as ops
+from reactivex import Observable
 
 Operator = Callable[[Observable], Observable]
 
